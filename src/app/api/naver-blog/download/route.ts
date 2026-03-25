@@ -6,6 +6,25 @@ import {
 
 export const runtime = 'nodejs';
 
+function normalizeNaverBlogUrl(rawUrl: string) {
+  const url = new URL(rawUrl);
+
+  if (
+    url.hostname !== 'blog.naver.com' &&
+    url.hostname !== 'm.blog.naver.com'
+  ) {
+    throw new Error('네이버 블로그 URL만 입력할 수 있습니다.');
+  }
+
+  if (url.hostname === 'm.blog.naver.com') {
+    url.hostname = 'blog.naver.com';
+  }
+
+  url.hash = '';
+
+  return url.toString();
+}
+
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
   const url = searchParams.get('url');
@@ -15,7 +34,8 @@ export async function GET(request: Request) {
   }
 
   try {
-    const data = await getNaverBlogPostData(url);
+    const normalizedUrl = normalizeNaverBlogUrl(url);
+    const data = await getNaverBlogPostData(normalizedUrl);
 
     if (data.images.length === 0) {
       return new Response('이미지가 없습니다.', { status: 404 });

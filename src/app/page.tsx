@@ -83,14 +83,19 @@ export default function Home() {
       const url = new URL(trimmed);
 
       if (
-        !url.hostname.includes('blog.naver.com') &&
-        !url.hostname.includes('m.blog.naver.com')
+        url.hostname !== 'blog.naver.com' &&
+        url.hostname !== 'm.blog.naver.com'
       ) {
         throw new Error('네이버 블로그 URL만 입력할 수 있습니다.');
       }
 
+      // 모바일 URL이면 PC URL로 강제 변환
+      if (url.hostname === 'm.blog.naver.com') {
+        url.hostname = 'blog.naver.com';
+      }
+
       setError('');
-      setSubmittedUrl(trimmed);
+      setSubmittedUrl(url.toString());
     } catch (error) {
       setError(
         error instanceof Error ? error.message : '올바른 URL 형식이 아닙니다.',
