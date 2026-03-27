@@ -301,6 +301,38 @@ function getPostRoot($: cheerio.CheerioAPI) {
   return null;
 }
 
+function removeEmbeddedLinkPreviewBlocks($$: cheerio.CheerioAPI) {
+  const blockSelectors = [
+    '.se-component.se-oglink',
+    '.se-section-oglink',
+    '.se-module-oglink',
+  ];
+
+  for (const selector of blockSelectors) {
+    $$(selector).remove();
+  }
+
+  $$('a[data-linktype="oglink"]').each((_, el) => {
+    const node = $$(el);
+    const container = node.closest(
+      '.se-component, .se-section, .se-module, .se-oglink-thumbnail, .se-oglink-info',
+    );
+
+    if (container.length > 0) {
+      container.remove();
+      return;
+    }
+
+    node.remove();
+  });
+
+  $$('[data-module*="oglink"], [data-module-v2*="oglink"]').remove();
+  $$(
+    '.se-oglink-thumbnail, .se-oglink-info, .se-oglink-info-container',
+  ).remove();
+  $$('.se-oglink-title, .se-oglink-summary, .se-oglink-url').remove();
+}
+
 function extractSrcListFromLinkData(parsed: unknown) {
   const result: string[] = [];
 
@@ -547,6 +579,7 @@ function extractArticleText(
     'script, style, noscript, iframe, svg, canvas, button, input, textarea, select, option',
   ).remove();
 
+  removeEmbeddedLinkPreviewBlocks($$);
   $$('#_photo_view_property').remove();
 
   const imageOrderMap = new Map<string, number>();
@@ -708,6 +741,7 @@ function extractArticleHtml(
     'script, style, noscript, iframe, svg, canvas, button, input, textarea, select, option',
   ).remove();
 
+  removeEmbeddedLinkPreviewBlocks($$);
   $$('#_photo_view_property').remove();
 
   $$('*').each((_, el) => {
