@@ -14,6 +14,11 @@ type BlogPostData = {
   resolvedUrl: string;
 };
 
+type MobilePhotoEntry = {
+  path?: string;
+  id?: string;
+};
+
 export function safeFilename(name: string) {
   return name
     .replace(/[<>:"/\\|?*\u0000-\u001F]/g, '')
@@ -46,14 +51,12 @@ async function fetchHtml(url: string) {
 async function resolveInnerPostUrl(inputUrl: string) {
   const url = new URL(inputUrl);
 
-  // 모바일 주소면 그대로 사용
   if (url.hostname === 'm.blog.naver.com') {
     return url.toString();
   }
 
   const outerHtml = await fetchHtml(url.toString());
 
-  // 일반 blog.naver.com 주소는 mainFrame 안에 실제 본문이 있는 경우가 많음
   const iframeMatch = outerHtml.match(
     /<iframe[^>]*id=["']?mainFrame["']?[^>]*src=["']([^"']+)["']/i,
   );
@@ -63,6 +66,44 @@ async function resolveInnerPostUrl(inputUrl: string) {
   }
 
   return url.toString();
+}
+
+function toMobilePostUrl(resolvedUrl: string) {
+  const url = new URL(resolvedUrl);
+
+  if (url.hostname === 'm.blog.naver.com') {
+    return url.toString();
+  }
+
+  // /{blogId}/{logNo}
+  const parts = url.pathname.split('/').filter(Boolean);
+  if (
+    url.hostname === 'blog.naver.com' &&
+    parts.length >= 2 &&
+    parts[0] !== 'PostView.naver'
+  ) {
+    return `https://m.blog.naver.com/${parts[0]}/${parts[1]}`;
+  }
+
+  // /PostView.naver?blogId=...&logNo=...
+  if (
+    url.pathname.endsWith('/PostView.naver') ||
+    url.pathname === '/PostView.naver'
+  ) {
+    const blogId = url.searchParams.get('blogId');
+    const logNo = url.searchParams.get('logNo');
+
+    if (blogId && logNo) {
+      return `https://m.blog.naver.com/${blogId}/${logNo}`;
+    }
+  }
+
+  throw new Error('모바일 포스트 URL로 변환하지 못했습니다.');
+}
+
+async function resolveMobilePostUrl(inputUrl: string) {
+  const resolved = await resolveInnerPostUrl(inputUrl);
+  return toMobilePostUrl(resolved);
 }
 
 function extractTitle($: cheerio.CheerioAPI, html: string) {
@@ -97,22 +138,20 @@ function decodeHtmlEntities(value: string) {
     .replace(/&gt;/g, '>');
 }
 
-function parseDataLinkData(raw: string): unknown {
-  const trimmed = raw.trim();
-
+function parseJsonSafely<T>(raw: string): T | null {
   const candidates = [
-    trimmed,
-    decodeHtmlEntities(trimmed),
+    raw,
+    decodeHtmlEntities(raw),
     (() => {
       try {
-        return decodeURIComponent(trimmed);
+        return decodeURIComponent(raw);
       } catch {
         return '';
       }
     })(),
     (() => {
       try {
-        return decodeURIComponent(decodeHtmlEntities(trimmed));
+        return decodeURIComponent(decodeHtmlEntities(raw));
       } catch {
         return '';
       }
@@ -121,7 +160,7 @@ function parseDataLinkData(raw: string): unknown {
 
   for (const candidate of candidates) {
     try {
-      return JSON.parse(candidate);
+      return JSON.parse(candidate) as T;
     } catch {
       // continue
     }
@@ -137,21 +176,19 @@ function normalizeImageUrl(rawUrl: string, baseUrl: string) {
   try {
     const url = new URL(absolute);
 
-    // viewer.html?src=... 형태면 실제 원본 URL로 복원
     const encodedSrc = url.searchParams.get('src');
     if (encodedSrc) {
       try {
-        const decoded = decodeURIComponent(encodedSrc);
-        if (/pstatic\.net/i.test(decoded)) {
-          return normalizeImageUrl(decoded, baseUrl);
-        }
+        return normalizeImageUrl(decodeURIComponent(encodedSrc), baseUrl);
       } catch {
         // ignore
       }
     }
 
-    // 미리보기/리사이즈용 파라미터 제거
     url.searchParams.delete('type');
+    url.searchParams.delete('w');
+    url.searchParams.delete('h');
+    url.searchParams.delete('size');
 
     return url.toString();
   } catch {
@@ -168,34 +205,118 @@ function getImageKey(imageUrl: string) {
   }
 }
 
-function isBetterImageUrl(nextUrl: string, prevUrl?: string) {
-  if (!prevUrl) return true;
+function normalizeMobileOriginalPath(path: string) {
+  const trimmed = decodeHtmlEntities(path).trim();
+  if (!trimmed) return '';
 
-  try {
-    const next = new URL(nextUrl);
-    const prev = new URL(prevUrl);
-
-    const nextType = next.searchParams.get('type');
-    const prevType = prev.searchParams.get('type');
-
-    // type 파라미터가 없는 쪽을 더 원본에 가깝다고 판단
-    if (!nextType && prevType) return true;
-    if (nextType && !prevType) return false;
-
-    return nextUrl.length >= prevUrl.length;
-  } catch {
-    return true;
+  if (/^https?:\/\//i.test(trimmed)) {
+    return normalizeImageUrl(trimmed, 'https://blogfiles.pstatic.net');
   }
+
+  if (trimmed.startsWith('//')) {
+    return normalizeImageUrl(
+      `https:${trimmed}`,
+      'https://blogfiles.pstatic.net',
+    );
+  }
+
+  return normalizeImageUrl(
+    `https://blogfiles.pstatic.net${trimmed.startsWith('/') ? '' : '/'}${trimmed}`,
+    'https://blogfiles.pstatic.net',
+  );
 }
 
-function extractImageUrls(
+function parseAttachImagePathAndIdInfo(raw: string) {
+  const parsed = parseJsonSafely<MobilePhotoEntry[]>(raw);
+  if (Array.isArray(parsed)) {
+    return parsed
+      .map((item) => (typeof item?.path === 'string' ? item.path : ''))
+      .filter(Boolean);
+  }
+
+  const decoded = decodeHtmlEntities(raw);
+  const matches = decoded.match(/"path"\s*:\s*"([^"]+)"/g) || [];
+
+  return matches
+    .map((chunk) => {
+      const match = chunk.match(/"path"\s*:\s*"([^"]+)"/);
+      return match?.[1] || '';
+    })
+    .filter(Boolean);
+}
+
+function extractOriginalImageUrlsFromMobileProperty($: cheerio.CheerioAPI) {
+  const photoBox = $('#_photo_view_property').first();
+  const raw = photoBox.attr('attachimagepathandidinfo');
+
+  if (!raw) {
+    return [];
+  }
+
+  const paths = parseAttachImagePathAndIdInfo(raw);
+  const dedup = new Map<string, string>();
+
+  for (const path of paths) {
+    const normalized = normalizeMobileOriginalPath(path);
+    if (!normalized) continue;
+
+    dedup.set(getImageKey(normalized), normalized);
+  }
+
+  return Array.from(dedup.values());
+}
+
+function getPostRoot($: cheerio.CheerioAPI) {
+  const selectors = [
+    '.se-main-container',
+    '#postViewArea',
+    '.post-view',
+    '.view',
+  ];
+
+  for (const selector of selectors) {
+    const root = $(selector).first();
+    if (root.length > 0) {
+      return root;
+    }
+  }
+
+  return null;
+}
+
+function extractSrcListFromLinkData(parsed: unknown) {
+  const result: string[] = [];
+
+  const pushSrc = (value: unknown) => {
+    if (typeof value === 'string' && value.trim()) {
+      result.push(value);
+    }
+  };
+
+  if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
+    pushSrc((parsed as { src?: unknown }).src);
+  }
+
+  if (Array.isArray(parsed)) {
+    for (const item of parsed) {
+      if (typeof item === 'object' && item !== null) {
+        pushSrc((item as { src?: unknown }).src);
+      }
+    }
+  }
+
+  return result;
+}
+
+function extractFallbackImageUrls(
   $: cheerio.CheerioAPI,
   html: string,
   baseUrl: string,
 ) {
   const originals = new Map<string, string>();
+  const root = getPostRoot($);
 
-  const addOriginal = (raw?: string | null) => {
+  const add = (raw?: string | null) => {
     if (!raw) return;
 
     const normalized = normalizeImageUrl(raw, baseUrl);
@@ -209,88 +330,66 @@ function extractImageUrls(
       return;
     }
 
-    const key = getImageKey(normalized);
-    const prev = originals.get(key);
-
-    if (isBetterImageUrl(normalized, prev)) {
-      originals.set(key, normalized);
-    }
+    originals.set(getImageKey(normalized), normalized);
   };
 
-  // 1순위: data-linkdata 내부의 원본 src
-  $('a[data-linktype="img"][data-linkdata]').each((_, el) => {
-    const raw = $(el).attr('data-linkdata');
-    if (!raw) return;
+  if (root) {
+    root.find('a[data-linktype="img"][data-linkdata]').each((_, el) => {
+      const raw = $(el).attr('data-linkdata');
+      if (!raw) return;
 
-    const parsed = parseDataLinkData(raw);
+      const parsed = parseJsonSafely<unknown>(raw);
+      if (!parsed) return;
 
-    if (!parsed) return;
-
-    if (
-      typeof parsed === 'object' &&
-      parsed !== null &&
-      'src' in parsed &&
-      typeof (parsed as { src?: unknown }).src === 'string'
-    ) {
-      addOriginal((parsed as { src: string }).src);
-    }
-
-    if (Array.isArray(parsed)) {
-      for (const item of parsed) {
-        if (
-          typeof item === 'object' &&
-          item !== null &&
-          'src' in item &&
-          typeof (item as { src?: unknown }).src === 'string'
-        ) {
-          addOriginal((item as { src: string }).src);
-        }
+      for (const src of extractSrcListFromLinkData(parsed)) {
+        add(src);
       }
-    }
-  });
+    });
+  }
 
-  // 2순위: 본문 HTML에서 원본 URL 직접 추출
+  if (originals.size === 0 && root) {
+    root.find('img').each((_, el) => {
+      const node = $(el);
+
+      add(node.attr('data-lazy-src'));
+      add(node.attr('data-src'));
+      add(node.attr('data-lw_src'));
+      add(node.attr('src'));
+    });
+  }
+
   if (originals.size === 0) {
+    const targetHtml = root ? root.html() || '' : html;
     const matches =
-      html.match(
+      targetHtml.match(
         /https?:\/\/[^\s"'<>]+(?:blogfiles|postfiles|mblogthumb-phinf|post-phinf|blogpfthumb-phinf)\.pstatic\.net[^\s"'<>]*/gi,
       ) || [];
 
     for (const match of matches) {
-      addOriginal(match);
-    }
-  }
-
-  // 3순위: fallback으로 img 태그 수집
-  if (originals.size === 0) {
-    const selectors = [
-      '.se-main-container img',
-      '#postViewArea img',
-      '.post-view img',
-      '.view img',
-      'img',
-    ];
-
-    for (const selector of selectors) {
-      $(selector).each((_, el) => {
-        const node = $(el);
-        addOriginal(node.attr('data-src'));
-        addOriginal(node.attr('data-lazy-src'));
-        addOriginal(node.attr('data-lw_src'));
-        addOriginal(node.attr('src'));
-      });
-
-      if (originals.size > 0) break;
+      add(match);
     }
   }
 
   return Array.from(originals.values());
 }
 
+function extractImageUrls(
+  $: cheerio.CheerioAPI,
+  html: string,
+  baseUrl: string,
+) {
+  const mobileOriginals = extractOriginalImageUrlsFromMobileProperty($);
+  if (mobileOriginals.length > 0) {
+    return mobileOriginals;
+  }
+
+  return extractFallbackImageUrls($, html, baseUrl);
+}
+
 export async function getNaverBlogPostData(
   inputUrl: string,
 ): Promise<BlogPostData> {
-  const resolvedUrl = await resolveInnerPostUrl(inputUrl);
+  const resolvedUrl = await resolveMobilePostUrl(inputUrl);
   const html = await fetchHtml(resolvedUrl);
   const $ = cheerio.load(html);
 
@@ -310,8 +409,9 @@ function detectExtension(imageUrl: string, contentType: string | null) {
   if (contentType?.includes('webp')) return 'webp';
   if (contentType?.includes('gif')) return 'gif';
   if (contentType?.includes('bmp')) return 'bmp';
-  if (contentType?.includes('jpeg') || contentType?.includes('jpg'))
+  if (contentType?.includes('jpeg') || contentType?.includes('jpg')) {
     return 'jpg';
+  }
 
   try {
     const pathname = new URL(imageUrl).pathname;
@@ -362,7 +462,7 @@ export async function buildImageZip(
       folder.file(fileName, arrayBuffer);
       successCount += 1;
     } catch {
-      // 개별 이미지 실패는 무시하고 계속 진행
+      // 개별 이미지 실패는 무시
     }
   }
 
