@@ -1,4 +1,5 @@
 import * as cheerio from 'cheerio';
+import type { Element } from 'domhandler';
 import JSZip from 'jszip';
 
 const DEFAULT_HEADERS = {
@@ -194,6 +195,22 @@ function normalizeImageUrl(rawUrl: string, baseUrl: string) {
   } catch {
     return absolute;
   }
+}
+
+function normalizeSrcsetValue(rawSrcset: string, baseUrl: string) {
+  return rawSrcset
+    .split(',')
+    .map((item) => item.trim())
+    .filter(Boolean)
+    .map((item) => {
+      const [rawUrl, ...descriptors] = item.split(/\s+/);
+      const normalized = normalizeImageUrl(rawUrl, baseUrl);
+      if (!normalized) return '';
+
+      return [normalized, ...descriptors].join(' ').trim();
+    })
+    .filter(Boolean)
+    .join(', ');
 }
 
 function getImageKey(imageUrl: string) {
@@ -396,7 +413,132 @@ function normalizeTextOutput(value: string) {
     .trim();
 }
 
-function extractArticleText($: cheerio.CheerioAPI, html: string) {
+function isSkippableImageUrl(url: string) {
+  return (
+    url.includes('ssl.pstatic.net/static') ||
+    url.includes('/favicon.ico') ||
+    url.includes('blank.gif')
+  );
+}
+
+function getFirstUrlFromSrcset(value?: string | null) {
+  if (!value) return '';
+
+  const first = value
+    .split(',')
+    .map((item) => item.trim())
+    .filter(Boolean)[0];
+
+  if (!first) return '';
+
+  return first.split(/\s+/)[0] || '';
+}
+
+function extractImageUrlsFromDataLinkData(raw: string, baseUrl: string) {
+  const parsed = parseJsonSafely<unknown>(raw);
+  if (!parsed) return [];
+
+  const dedup = new Map<string, string>();
+
+  for (const src of extractSrcListFromLinkData(parsed)) {
+    const normalized = normalizeImageUrl(src, baseUrl);
+    if (!normalized) continue;
+    if (isSkippableImageUrl(normalized)) continue;
+
+    dedup.set(getImageKey(normalized), normalized);
+  }
+
+  return Array.from(dedup.values());
+}
+
+function getNodeImageUrlForText(
+  node: cheerio.Cheerio<Element>,
+  baseUrl: string,
+) {
+  const candidates = [
+    node.attr('data-lazy-src'),
+    node.attr('data-src'),
+    node.attr('data-lw_src'),
+    node.attr('src'),
+    node.attr('poster'),
+    getFirstUrlFromSrcset(node.attr('srcset')),
+  ];
+
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+
+    const normalized = normalizeImageUrl(candidate, baseUrl);
+    if (!normalized) continue;
+    if (isSkippableImageUrl(normalized)) continue;
+
+    return normalized;
+  }
+
+  return '';
+}
+
+function findImageIndexFromCandidates(
+  candidateUrls: string[],
+  imageOrderMap: Map<string, number>,
+) {
+  for (const url of candidateUrls) {
+    const index = imageOrderMap.get(getImageKey(url));
+    if (index) return index;
+  }
+
+  return null;
+}
+
+function detectExtension(imageUrl: string, contentType: string | null) {
+  if (contentType?.includes('png')) return 'png';
+  if (contentType?.includes('webp')) return 'webp';
+  if (contentType?.includes('gif')) return 'gif';
+  if (contentType?.includes('bmp')) return 'bmp';
+  if (contentType?.includes('jpeg') || contentType?.includes('jpg')) {
+    return 'jpg';
+  }
+
+  try {
+    const pathname = new URL(imageUrl).pathname;
+    const ext = pathname.split('.').pop()?.toLowerCase();
+    if (ext && ['jpg', 'jpeg', 'png', 'webp', 'gif', 'bmp'].includes(ext)) {
+      return ext === 'jpeg' ? 'jpg' : ext;
+    }
+  } catch {
+    // ignore
+  }
+
+  return 'jpg';
+}
+
+function buildTextImageMarker(index: number, orderedImageUrls: string[]) {
+  const imageUrl = orderedImageUrls[index - 1] || '';
+  const ext = detectExtension(imageUrl, null);
+
+  return `(이미지-${String(index).padStart(3, '0')}.${ext})`;
+}
+
+function escapeHtml(value: string) {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function buildHtmlImageLabel(index: number, orderedImageUrls: string[]) {
+  return `<p class="article-image-label">${escapeHtml(
+    buildTextImageMarker(index, orderedImageUrls),
+  )}</p>`;
+}
+
+function extractArticleText(
+  $: cheerio.CheerioAPI,
+  html: string,
+  baseUrl: string,
+  orderedImageUrls: string[],
+) {
   const root = getPostRoot($);
   const targetHtml = root ? $.html(root) : html;
   const $$ = cheerio.load(targetHtml);
@@ -407,19 +549,114 @@ function extractArticleText($: cheerio.CheerioAPI, html: string) {
 
   $$('#_photo_view_property').remove();
 
+  const imageOrderMap = new Map<string, number>();
+  orderedImageUrls.forEach((imageUrl, index) => {
+    imageOrderMap.set(getImageKey(imageUrl), index + 1);
+  });
+
+  const usedIndexes = new Set<number>();
+  let nextFallbackIndex = 1;
+
+  const reserveImageIndex = (preferredIndex?: number | null) => {
+    if (preferredIndex && !usedIndexes.has(preferredIndex)) {
+      usedIndexes.add(preferredIndex);
+      return preferredIndex;
+    }
+
+    while (nextFallbackIndex <= orderedImageUrls.length) {
+      const current = nextFallbackIndex;
+      nextFallbackIndex += 1;
+
+      if (!usedIndexes.has(current)) {
+        usedIndexes.add(current);
+        return current;
+      }
+    }
+
+    return null;
+  };
+
+  const replaceWithImageMarker = (
+    node: cheerio.Cheerio<Element>,
+    candidateUrls: string[],
+  ) => {
+    const matchedIndex = findImageIndexFromCandidates(
+      candidateUrls,
+      imageOrderMap,
+    );
+
+    const imageIndex = reserveImageIndex(matchedIndex);
+
+    if (!imageIndex) {
+      node.remove();
+      return;
+    }
+
+    node.replaceWith(
+      `\n${buildTextImageMarker(imageIndex, orderedImageUrls)}\n`,
+    );
+  };
+
   $$('br').replaceWith('\n');
   $$('hr').replaceWith('\n----------------------------------------\n');
 
-  $$('img, video, picture, source').each((_, el) => {
+  $$('a[data-linktype="img"][data-linkdata]').each((_, el) => {
     const node = $$(el);
-    const alt = (node.attr('alt') || '').trim();
+    const raw = node.attr('data-linkdata');
 
-    if (alt) {
-      node.replaceWith(`\n[이미지: ${alt}]\n`);
-    } else {
+    if (!raw) {
       node.remove();
+      return;
     }
+
+    const candidateUrls = extractImageUrlsFromDataLinkData(raw, baseUrl);
+
+    if (candidateUrls.length === 0) {
+      node.remove();
+      return;
+    }
+
+    replaceWithImageMarker(node, candidateUrls);
   });
+
+  $$('picture').each((_, el) => {
+    const node = $$(el);
+    const candidateUrls: string[] = [];
+
+    const pictureUrl = getNodeImageUrlForText(node, baseUrl);
+    if (pictureUrl) candidateUrls.push(pictureUrl);
+
+    node.find('source, img').each((__, child) => {
+      const childNode = $$(child);
+      const childUrl = getNodeImageUrlForText(childNode, baseUrl);
+      if (childUrl) candidateUrls.push(childUrl);
+    });
+
+    const dedup = Array.from(
+      new Map(candidateUrls.map((url) => [getImageKey(url), url])).values(),
+    );
+
+    if (dedup.length === 0) {
+      node.remove();
+      return;
+    }
+
+    replaceWithImageMarker(node, dedup);
+  });
+
+  $$('img, video').each((_, el) => {
+    const node = $$(el);
+    const normalizedImageUrl = getNodeImageUrlForText(node, baseUrl);
+
+    if (!normalizedImageUrl) {
+      node.remove();
+      return;
+    }
+
+    replaceWithImageMarker(node, [normalizedImageUrl]);
+  });
+
+  $$('source').remove();
 
   $$('li').each((_, el) => {
     const node = $$(el);
@@ -461,6 +698,7 @@ function extractArticleHtml(
   $: cheerio.CheerioAPI,
   html: string,
   baseUrl: string,
+  orderedImageUrls: string[],
 ) {
   const root = getPostRoot($);
   const targetHtml = root ? $.html(root) : html;
@@ -495,6 +733,22 @@ function extractArticleHtml(
       node.removeAttr('data-lazy-src');
     }
 
+    const poster = node.attr('poster');
+    if (poster) {
+      const normalized = normalizeImageUrl(poster, baseUrl);
+      if (normalized) node.attr('poster', normalized);
+    }
+
+    const srcset = node.attr('srcset');
+    if (srcset) {
+      const normalized = normalizeSrcsetValue(srcset, baseUrl);
+      if (normalized) {
+        node.attr('srcset', normalized);
+      } else {
+        node.removeAttr('srcset');
+      }
+    }
+
     const href = node.attr('href');
     if (href) {
       const absoluteHref = toAbsoluteUrl(baseUrl, href);
@@ -502,17 +756,109 @@ function extractArticleHtml(
     }
   });
 
+  const imageOrderMap = new Map<string, number>();
+  orderedImageUrls.forEach((imageUrl, index) => {
+    imageOrderMap.set(getImageKey(imageUrl), index + 1);
+  });
+
+  const usedIndexes = new Set<number>();
+  let nextFallbackIndex = 1;
+
+  const reserveImageIndex = (preferredIndex?: number | null) => {
+    if (preferredIndex && !usedIndexes.has(preferredIndex)) {
+      usedIndexes.add(preferredIndex);
+      return preferredIndex;
+    }
+
+    while (nextFallbackIndex <= orderedImageUrls.length) {
+      const current = nextFallbackIndex;
+      nextFallbackIndex += 1;
+
+      if (!usedIndexes.has(current)) {
+        usedIndexes.add(current);
+        return current;
+      }
+    }
+
+    return null;
+  };
+
+  const insertImageLabel = (
+    node: cheerio.Cheerio<Element>,
+    candidateUrls: string[],
+  ) => {
+    const matchedIndex = findImageIndexFromCandidates(
+      candidateUrls,
+      imageOrderMap,
+    );
+
+    const imageIndex = reserveImageIndex(matchedIndex);
+    if (!imageIndex) return;
+
+    node.before(buildHtmlImageLabel(imageIndex, orderedImageUrls));
+    node.attr('data-export-image-processed', '1');
+    node
+      .find('img, video, picture, source')
+      .attr('data-export-image-skip', '1');
+  };
+
+  $$('a[data-linktype="img"][data-linkdata]').each((_, el) => {
+    const node = $$(el);
+    if (node.attr('data-export-image-skip') === '1') return;
+
+    const raw = node.attr('data-linkdata');
+    if (!raw) return;
+
+    const candidateUrls = extractImageUrlsFromDataLinkData(raw, baseUrl);
+    if (candidateUrls.length === 0) return;
+
+    insertImageLabel(node, candidateUrls);
+  });
+
+  $$('picture').each((_, el) => {
+    const node = $$(el);
+    if (node.attr('data-export-image-skip') === '1') return;
+    if (node.parents('a[data-linktype="img"][data-linkdata]').length > 0)
+      return;
+
+    const candidateUrls: string[] = [];
+
+    const pictureUrl = getNodeImageUrlForText(node, baseUrl);
+    if (pictureUrl) candidateUrls.push(pictureUrl);
+
+    node.find('source, img').each((__, child) => {
+      const childNode = $$(child);
+      const childUrl = getNodeImageUrlForText(childNode, baseUrl);
+      if (childUrl) candidateUrls.push(childUrl);
+    });
+
+    const dedup = Array.from(
+      new Map(candidateUrls.map((url) => [getImageKey(url), url])).values(),
+    );
+
+    if (dedup.length === 0) return;
+
+    insertImageLabel(node, dedup);
+  });
+
+  $$('img, video').each((_, el) => {
+    const node = $$(el);
+    if (node.attr('data-export-image-skip') === '1') return;
+    if (node.parents('picture').length > 0) return;
+    if (node.parents('a[data-linktype="img"][data-linkdata]').length > 0)
+      return;
+
+    const normalizedImageUrl = getNodeImageUrlForText(node, baseUrl);
+    if (!normalizedImageUrl) return;
+
+    insertImageLabel(node, [normalizedImageUrl]);
+  });
+
+  $$('[data-export-image-skip]').removeAttr('data-export-image-skip');
+  $$('[data-export-image-processed]').removeAttr('data-export-image-processed');
+
   const bodyHtml = $$.root().html()?.trim();
   return bodyHtml || '<p>본문을 추출하지 못했습니다.</p>';
-}
-
-function escapeHtml(value: string) {
-  return value
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;');
 }
 
 export function buildArticleTextFile(title: string, contentText: string) {
@@ -568,6 +914,13 @@ export function buildArticleHtmlFile(
         font-size: 14px;
         color: #6b7280;
       }
+      .article-image-label {
+        margin: 20px 0 8px;
+        font-size: 14px;
+        line-height: 1.5;
+        color: #4b5563;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      }
     </style>
   </head>
   <body>
@@ -594,8 +947,8 @@ export async function getNaverBlogPostData(
 
   const title = extractTitle($, html);
   const images = extractImageUrls($, html, resolvedUrl);
-  const contentText = extractArticleText($, html);
-  const contentHtml = extractArticleHtml($, html, resolvedUrl);
+  const contentText = extractArticleText($, html, resolvedUrl, images);
+  const contentHtml = extractArticleHtml($, html, resolvedUrl, images);
 
   return {
     title,
@@ -605,28 +958,6 @@ export async function getNaverBlogPostData(
     sourceUrl: inputUrl,
     resolvedUrl,
   };
-}
-
-function detectExtension(imageUrl: string, contentType: string | null) {
-  if (contentType?.includes('png')) return 'png';
-  if (contentType?.includes('webp')) return 'webp';
-  if (contentType?.includes('gif')) return 'gif';
-  if (contentType?.includes('bmp')) return 'bmp';
-  if (contentType?.includes('jpeg') || contentType?.includes('jpg')) {
-    return 'jpg';
-  }
-
-  try {
-    const pathname = new URL(imageUrl).pathname;
-    const ext = pathname.split('.').pop()?.toLowerCase();
-    if (ext && ['jpg', 'jpeg', 'png', 'webp', 'gif', 'bmp'].includes(ext)) {
-      return ext === 'jpeg' ? 'jpg' : ext;
-    }
-  } catch {
-    // ignore
-  }
-
-  return 'jpg';
 }
 
 export async function buildImageZip(
