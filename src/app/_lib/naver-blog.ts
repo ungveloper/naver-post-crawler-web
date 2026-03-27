@@ -11,6 +11,7 @@ type BlogPostData = {
   title: string;
   images: string[];
   contentText: string;
+  contentHtml: string;
   sourceUrl: string;
   resolvedUrl: string;
 };
@@ -76,7 +77,6 @@ function toMobilePostUrl(resolvedUrl: string) {
     return url.toString();
   }
 
-  // /{blogId}/{logNo}
   const parts = url.pathname.split('/').filter(Boolean);
   if (
     url.hostname === 'blog.naver.com' &&
@@ -86,7 +86,6 @@ function toMobilePostUrl(resolvedUrl: string) {
     return `https://m.blog.naver.com/${parts[0]}/${parts[1]}`;
   }
 
-  // /PostView.naver?blogId=...&logNo=...
   if (
     url.pathname.endsWith('/PostView.naver') ||
     url.pathname === '/PostView.naver'
@@ -458,8 +457,132 @@ function extractArticleText($: cheerio.CheerioAPI, html: string) {
   return text || '본문을 추출하지 못했습니다.';
 }
 
+function extractArticleHtml(
+  $: cheerio.CheerioAPI,
+  html: string,
+  baseUrl: string,
+) {
+  const root = getPostRoot($);
+  const targetHtml = root ? $.html(root) : html;
+  const $$ = cheerio.load(targetHtml);
+
+  $$(
+    'script, style, noscript, iframe, svg, canvas, button, input, textarea, select, option',
+  ).remove();
+
+  $$('#_photo_view_property').remove();
+
+  $$('*').each((_, el) => {
+    const node = $$(el);
+
+    const src = node.attr('src');
+    if (src) {
+      const normalized = normalizeImageUrl(src, baseUrl);
+      if (normalized) node.attr('src', normalized);
+    }
+
+    const dataSrc = node.attr('data-src');
+    if (dataSrc) {
+      const normalized = normalizeImageUrl(dataSrc, baseUrl);
+      if (normalized) node.attr('src', normalized);
+      node.removeAttr('data-src');
+    }
+
+    const lazySrc = node.attr('data-lazy-src');
+    if (lazySrc) {
+      const normalized = normalizeImageUrl(lazySrc, baseUrl);
+      if (normalized) node.attr('src', normalized);
+      node.removeAttr('data-lazy-src');
+    }
+
+    const href = node.attr('href');
+    if (href) {
+      const absoluteHref = toAbsoluteUrl(baseUrl, href);
+      if (absoluteHref) node.attr('href', absoluteHref);
+    }
+  });
+
+  const bodyHtml = $$.root().html()?.trim();
+  return bodyHtml || '<p>본문을 추출하지 못했습니다.</p>';
+}
+
+function escapeHtml(value: string) {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
 export function buildArticleTextFile(title: string, contentText: string) {
   return [title, '', contentText].join('\n').trim();
+}
+
+export function buildArticleHtmlFile(
+  title: string,
+  contentHtml: string,
+  sourceUrl: string,
+) {
+  const safeTitle = escapeHtml(title || '네이버 블로그 글');
+  const safeSourceUrl = escapeHtml(sourceUrl);
+
+  return `<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>${safeTitle}</title>
+    <style>
+      body {
+        max-width: 860px;
+        margin: 40px auto;
+        padding: 0 20px;
+        line-height: 1.7;
+        color: #111827;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Noto Sans KR", sans-serif;
+        word-break: break-word;
+      }
+      img {
+        max-width: 100%;
+        height: auto;
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+      }
+      a {
+        color: #2563eb;
+      }
+      .article-header {
+        margin-bottom: 32px;
+        padding-bottom: 16px;
+        border-bottom: 1px solid #e5e7eb;
+      }
+      .article-title {
+        font-size: 28px;
+        font-weight: 700;
+        margin: 0 0 12px;
+      }
+      .article-source {
+        font-size: 14px;
+        color: #6b7280;
+      }
+    </style>
+  </head>
+  <body>
+    <header class="article-header">
+      <h1 class="article-title">${safeTitle}</h1>
+      <p class="article-source">
+        원문:
+        <a href="${safeSourceUrl}" target="_blank" rel="noopener noreferrer">${safeSourceUrl}</a>
+      </p>
+    </header>
+    <main>
+      ${contentHtml}
+    </main>
+  </body>
+</html>`;
 }
 
 export async function getNaverBlogPostData(
@@ -472,11 +595,13 @@ export async function getNaverBlogPostData(
   const title = extractTitle($, html);
   const images = extractImageUrls($, html, resolvedUrl);
   const contentText = extractArticleText($, html);
+  const contentHtml = extractArticleHtml($, html, resolvedUrl);
 
   return {
     title,
     images,
     contentText,
+    contentHtml,
     sourceUrl: inputUrl,
     resolvedUrl,
   };

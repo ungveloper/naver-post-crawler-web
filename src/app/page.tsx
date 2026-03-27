@@ -58,8 +58,9 @@ export default function Home() {
   const [loading, setLoading] = useState<boolean>(false);
   const [error, setError] = useState<string>('');
   const [actionError, setActionError] = useState<string>('');
-  const [downloading, setDownloading] = useState<boolean>(false);
+  const [imageDownloading, setImageDownloading] = useState<boolean>(false);
   const [textDownloading, setTextDownloading] = useState<boolean>(false);
+  const [htmlDownloading, setHtmlDownloading] = useState<boolean>(false);
 
   useEffect(() => {
     let ignore: boolean = false;
@@ -158,15 +159,15 @@ export default function Home() {
     }
   };
 
-  const handleDownload = async () => {
-    if (!submittedUrl || downloading) return;
+  const handleImageDownload = async () => {
+    if (!submittedUrl || imageDownloading) return;
 
     try {
-      setDownloading(true);
+      setImageDownloading(true);
       setActionError('');
 
       await downloadByFetch(
-        `/api/naver-blog/download?url=${encodeURIComponent(submittedUrl)}`,
+        `/api/naver-blog/image?url=${encodeURIComponent(submittedUrl)}`,
         'naver-blog-images.zip',
       );
     } catch (error) {
@@ -176,7 +177,7 @@ export default function Home() {
           : '이미지 다운로드에 실패했습니다.',
       );
     } finally {
-      setDownloading(false);
+      setImageDownloading(false);
     }
   };
 
@@ -199,6 +200,28 @@ export default function Home() {
       );
     } finally {
       setTextDownloading(false);
+    }
+  };
+
+  const handleHtmlDownload = async () => {
+    if (!submittedUrl || htmlDownloading) return;
+
+    try {
+      setHtmlDownloading(true);
+      setActionError('');
+
+      await downloadByFetch(
+        `/api/naver-blog/html?url=${encodeURIComponent(submittedUrl)}`,
+        'naver-blog-article.html',
+      );
+    } catch (error) {
+      setActionError(
+        error instanceof Error
+          ? error.message
+          : 'HTML 다운로드에 실패했습니다.',
+      );
+    } finally {
+      setHtmlDownloading(false);
     }
   };
 
@@ -261,12 +284,14 @@ export default function Home() {
             {imageCount > 0 && (
               <button
                 type="button"
-                onClick={handleDownload}
-                disabled={!submittedUrl || loading || !!error || downloading}
+                onClick={handleImageDownload}
+                disabled={
+                  !submittedUrl || loading || !!error || imageDownloading
+                }
                 className="px-4 py-2 rounded-lg bg-black text-white cursor-pointer
                 disabled:cursor-not-allowed disabled:opacity-50"
               >
-                {downloading
+                {imageDownloading
                   ? '이미지 다운로드 준비 중...'
                   : `이미지 ${imageCount}장 다운로드`}
               </button>
@@ -282,6 +307,16 @@ export default function Home() {
               {textDownloading
                 ? 'TXT 다운로드 준비 중...'
                 : '아티클 본문 TXT 다운로드'}
+            </button>
+
+            <button
+              type="button"
+              onClick={handleHtmlDownload}
+              disabled={!submittedUrl || loading || !!error || htmlDownloading}
+              className="px-4 py-2 rounded-lg border cursor-pointer
+              disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {htmlDownloading ? 'HTML 다운로드 준비 중...' : 'HTML 다운받기'}
             </button>
           </div>
         )}
