@@ -3,6 +3,53 @@
 import { SubmitEvent, useEffect, useState } from 'react';
 import { CopyToClipboard } from 'react-copy-to-clipboard';
 
+function getFilenameFromContentDisposition(value: string | null) {
+  if (!value) return null;
+
+  const utf8Match = value.match(/filename\*=UTF-8''([^;]+)/i);
+  if (utf8Match?.[1]) {
+    try {
+      return decodeURIComponent(utf8Match[1]);
+    } catch {
+      // ignore
+    }
+  }
+
+  const asciiMatch = value.match(/filename="?([^"]+)"?/i);
+  return asciiMatch?.[1] || null;
+}
+
+async function downloadByFetch(url: string, fallbackFileName: string) {
+  const res = await fetch(url, {
+    cache: 'no-store',
+  });
+
+  if (!res.ok) {
+    const message = await res.text().catch(() => '');
+    throw new Error(message || '다운로드에 실패했습니다.');
+  }
+
+  const blob = await res.blob();
+  const fileName =
+    getFilenameFromContentDisposition(res.headers.get('content-disposition')) ||
+    fallbackFileName;
+
+  const objectUrl = window.URL.createObjectURL(blob);
+  const anchor = document.createElement('a');
+
+  anchor.href = objectUrl;
+  anchor.download = fileName;
+  anchor.rel = 'noopener';
+
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+
+  window.setTimeout(() => {
+    window.URL.revokeObjectURL(objectUrl);
+  }, 1000);
+}
+
 export default function Home() {
   const [inputUrl, setInputUrl] = useState<string>('');
   const [submittedUrl, setSubmittedUrl] = useState<string>('');
@@ -10,7 +57,9 @@ export default function Home() {
   const [imageCount, setImageCount] = useState<number>(0);
   const [loading, setLoading] = useState<boolean>(false);
   const [error, setError] = useState<string>('');
+  const [actionError, setActionError] = useState<string>('');
   const [downloading, setDownloading] = useState<boolean>(false);
+  const [textDownloading, setTextDownloading] = useState<boolean>(false);
 
   useEffect(() => {
     let ignore: boolean = false;
@@ -21,6 +70,7 @@ export default function Home() {
       try {
         setLoading(true);
         setError('');
+        setActionError('');
         setTitle('제목 불러오는 중...');
         setImageCount(0);
 
@@ -73,6 +123,7 @@ export default function Home() {
 
     if (!trimmed) {
       setError('네이버 블로그 URL을 입력해 주세요.');
+      setActionError('');
       setSubmittedUrl('');
       setTitle('블로그 URL을 입력해 주세요.');
       setImageCount(0);
@@ -89,37 +140,66 @@ export default function Home() {
         throw new Error('네이버 블로그 URL만 입력할 수 있습니다.');
       }
 
-      // 모바일 URL이면 PC URL로 강제 변환
       if (url.hostname === 'm.blog.naver.com') {
         url.hostname = 'blog.naver.com';
       }
 
       setError('');
+      setActionError('');
       setSubmittedUrl(url.toString());
     } catch (error) {
       setError(
         error instanceof Error ? error.message : '올바른 URL 형식이 아닙니다.',
       );
+      setActionError('');
       setSubmittedUrl('');
       setTitle('올바른 URL을 입력해 주세요.');
       setImageCount(0);
     }
   };
 
-  const handleDownload = () => {
-    if (!submittedUrl) return;
+  const handleDownload = async () => {
+    if (!submittedUrl || downloading) return;
 
-    setDownloading(true);
+    try {
+      setDownloading(true);
+      setActionError('');
 
-    const downloadUrl = `/api/naver-blog/download?url=${encodeURIComponent(
-      submittedUrl,
-    )}`;
-
-    window.location.href = downloadUrl;
-
-    setTimeout(() => {
+      await downloadByFetch(
+        `/api/naver-blog/download?url=${encodeURIComponent(submittedUrl)}`,
+        'naver-blog-images.zip',
+      );
+    } catch (error) {
+      setActionError(
+        error instanceof Error
+          ? error.message
+          : '이미지 다운로드에 실패했습니다.',
+      );
+    } finally {
       setDownloading(false);
-    }, 1500);
+    }
+  };
+
+  const handleTextDownload = async () => {
+    if (!submittedUrl || textDownloading) return;
+
+    try {
+      setTextDownloading(true);
+      setActionError('');
+
+      await downloadByFetch(
+        `/api/naver-blog/text?url=${encodeURIComponent(submittedUrl)}`,
+        'naver-blog-article.txt',
+      );
+    } catch (error) {
+      setActionError(
+        error instanceof Error
+          ? error.message
+          : '텍스트 다운로드에 실패했습니다.',
+      );
+    } finally {
+      setTextDownloading(false);
+    }
   };
 
   return (
@@ -133,7 +213,7 @@ export default function Home() {
             value={inputUrl}
             onChange={(e) => setInputUrl(e.target.value)}
             placeholder="네이버 블로그 포스팅 URL을 입력해주세요."
-            className="flex-1  py-3 outline-none"
+            className="flex-1 py-3 outline-none"
           />
           <button
             type="submit"
@@ -173,20 +253,37 @@ export default function Home() {
           )}
 
           {error && <p className="text-red-500">{error}</p>}
+          {actionError && <p className="text-red-500">{actionError}</p>}
         </div>
 
-        {imageCount > 0 && (
-          <button
-            onClick={handleDownload}
-            disabled={!submittedUrl || loading || !!error || downloading}
-            className={`mt-4 px-4 py-2 rounded-lg bg-black text-white cursor-pointer
-            disabled:cursor-not-allowed disabled:opacity-50
-            `}
-          >
-            {downloading
-              ? '압축 파일 생성 중...'
-              : `이미지 ${imageCount}장 다운로드`}
-          </button>
+        {submittedUrl && !error && (
+          <div className="mt-4 flex flex-col gap-2">
+            {imageCount > 0 && (
+              <button
+                type="button"
+                onClick={handleDownload}
+                disabled={!submittedUrl || loading || !!error || downloading}
+                className="px-4 py-2 rounded-lg bg-black text-white cursor-pointer
+                disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {downloading
+                  ? '이미지 다운로드 준비 중...'
+                  : `이미지 ${imageCount}장 다운로드`}
+              </button>
+            )}
+
+            <button
+              type="button"
+              onClick={handleTextDownload}
+              disabled={!submittedUrl || loading || !!error || textDownloading}
+              className="px-4 py-2 rounded-lg border cursor-pointer
+              disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {textDownloading
+                ? 'TXT 다운로드 준비 중...'
+                : '아티클 본문 TXT 다운로드'}
+            </button>
+          </div>
         )}
       </div>
     </main>

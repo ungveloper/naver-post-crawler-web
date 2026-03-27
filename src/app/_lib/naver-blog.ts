@@ -10,6 +10,7 @@ const DEFAULT_HEADERS = {
 type BlogPostData = {
   title: string;
   images: string[];
+  contentText: string;
   sourceUrl: string;
   resolvedUrl: string;
 };
@@ -386,6 +387,81 @@ function extractImageUrls(
   return extractFallbackImageUrls($, html, baseUrl);
 }
 
+function normalizeTextOutput(value: string) {
+  return value
+    .replace(/\u00a0/g, ' ')
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n[ \t]+/g, '\n')
+    .replace(/[ \t]{2,}/g, ' ')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+function extractArticleText($: cheerio.CheerioAPI, html: string) {
+  const root = getPostRoot($);
+  const targetHtml = root ? $.html(root) : html;
+  const $$ = cheerio.load(targetHtml);
+
+  $$(
+    'script, style, noscript, iframe, svg, canvas, button, input, textarea, select, option',
+  ).remove();
+
+  $$('#_photo_view_property').remove();
+
+  $$('br').replaceWith('\n');
+  $$('hr').replaceWith('\n----------------------------------------\n');
+
+  $$('img, video, picture, source').each((_, el) => {
+    const node = $$(el);
+    const alt = (node.attr('alt') || '').trim();
+
+    if (alt) {
+      node.replaceWith(`\n[이미지: ${alt}]\n`);
+    } else {
+      node.remove();
+    }
+  });
+
+  $$('li').each((_, el) => {
+    const node = $$(el);
+    if (node.text().trim()) {
+      node.prepend('• ');
+      node.append('\n');
+    }
+  });
+
+  $$('td, th').each((_, el) => {
+    const node = $$(el);
+    if (node.text().trim()) {
+      node.append('\t');
+    }
+  });
+
+  $$('tr').each((_, el) => {
+    const node = $$(el);
+    if (node.text().trim()) {
+      node.append('\n');
+    }
+  });
+
+  $$(
+    'p, div, section, article, header, footer, aside, blockquote, figcaption, h1, h2, h3, h4, h5, h6, ul, ol, table, pre',
+  ).each((_, el) => {
+    const node = $$(el);
+    if (node.text().trim()) {
+      node.append('\n');
+    }
+  });
+
+  const text = normalizeTextOutput(decodeHtmlEntities($$.root().text()));
+
+  return text || '본문을 추출하지 못했습니다.';
+}
+
+export function buildArticleTextFile(title: string, contentText: string) {
+  return [title, '', contentText].join('\n').trim();
+}
+
 export async function getNaverBlogPostData(
   inputUrl: string,
 ): Promise<BlogPostData> {
@@ -395,10 +471,12 @@ export async function getNaverBlogPostData(
 
   const title = extractTitle($, html);
   const images = extractImageUrls($, html, resolvedUrl);
+  const contentText = extractArticleText($, html);
 
   return {
     title,
     images,
+    contentText,
     sourceUrl: inputUrl,
     resolvedUrl,
   };
